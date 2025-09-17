@@ -1,0 +1,49 @@
+{
+  "family": "correlation-task",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::528104389666:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::528104389666:role/ecsTaskRole",
+  "containerDefinitions": [
+    {
+      "name": "correlation",
+      "image": "528104389666.dkr.ecr.ap-southeast-1.amazonaws.com/correlation:latest",
+      "portMappings": [
+        {
+          "containerPort": 8004,
+          "protocol": "tcp",
+          "name": "http"
+        }
+      ],
+      "essential": true,
+      "environment": [
+        {"name": "ENVIRONMENT", "value": "development"},
+        {"name": "AWS_DEFAULT_REGION", "value": "ap-southeast-1"}
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/correlation",
+          "awslogs-region": "ap-southeast-1",
+          "awslogs-stream-prefix": "ecs",
+          "awslogs-create-group": "true"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:8004/health || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      },
+      "stopTimeout": 30
+    }
+  ],
+  "tags": [
+    {"key": "Environment", "value": "dev"},
+    {"key": "Service", "value": "correlation"},
+    {"key": "CostCenter", "value": "development"}
+  ]
+}
