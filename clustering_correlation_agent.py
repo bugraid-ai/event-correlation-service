@@ -2,38 +2,20 @@ import json
 import boto3
 import asyncio
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional, Tuple
-from contextlib import asynccontextmanager
-
 import numpy as np
 from sklearn.cluster import DBSCAN
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics.pairwise import cosine_similarity
-try:
-    from sentence_transformers import SentenceTransformer
-    SENTENCE_TRANSFORMERS_AVAILABLE = True
-except ImportError:
-    SentenceTransformer = None
-    SENTENCE_TRANSFORMERS_AVAILABLE = False
+from sentence_transformers import SentenceTransformer
 from collections import defaultdict
 import logging
 import uuid
 import re
-try:
-    from opensearchpy import OpenSearch, exceptions as os_exceptions
-    OPENSEARCH_AVAILABLE = True
-except ImportError:
-    OpenSearch = None
-    os_exceptions = None
-    OPENSEARCH_AVAILABLE = False
-try:
-    import redis
-    REDIS_AVAILABLE = True
-except ImportError:
-    redis = None
-    REDIS_AVAILABLE = False
+import redis
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
@@ -49,7 +31,7 @@ class CorrelationRequest(BaseModel):
     alerts: List[Dict[str, Any]] = Field(..., description="List of alerts to correlate")
     environment: str = Field(..., description="Environment (development or production)")
     source: str = Field(..., description="Source of the alerts")
-    timestamp: str = Field(default_factory=lambda: datetime.utcnow().isoformat() + 'Z')
+    timestamp: str = Field(default_factory=lambda: datetime.utcnow().replace(tzinfo=timezone.utc).isoformat().replace('+00:00', 'Z'))
 
 class IncidentCluster(BaseModel):
     incident_id: str
@@ -113,6 +95,9 @@ class EventCorrelationAgent:
             }
         }
         
+        # Additional SQS queue for incident job processing
+        self.edal_jobs_queue_url = "https://sqs.ap-southeast-1.amazonaws.com/528104389666/edal-dev-jobs-queue"
+        
         # Configuration parameters
         self.time_window_minutes = self.config.get('time_window_minutes', 15)
         self.similarity_threshold = self.config.get('similarity_threshold', 0.3)
@@ -128,261 +113,343 @@ class EventCorrelationAgent:
             raise ValueError(f"Invalid ENVIRONMENT value: {self.environment}")
         
         # Initialize sentence transformer for semantic similarity
-        if SENTENCE_TRANSFORMERS_AVAILABLE:
             try:
                 self.sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
-                logger.info("Successfully loaded SentenceTransformer model")
             except Exception as e:
                 logger.warning(f"Could not load SentenceTransformer: {e}")
-                logger.warning("Falling back to TF-IDF for semantic similarity")
-                self.sentence_model = None
-        else:
-            logger.warning("sentence_transformers not available, using TF-IDF fallback")
             self.sentence_model = None
         # Track SQS acknowledgements by queue type
         self._sqs_acks: Dict[str, List[str]] = {"incidents": [], "timelines": [], "counters": []}
 
-        # Initialize OpenSearch client for timeline storage (strict per-environment index)
-        if self.environment == 'production':
-            self.os_index = 'incidents'
-        elif self.environment == 'development':
-            self.os_index = 'dev-incidents'
-        else:
-            raise ValueError(f"Invalid environment for OpenSearch index: {self.environment}")
-        self.os: Optional[OpenSearch] = None
-        # Initialize OpenSearch (optional for development)
-        if not OPENSEARCH_AVAILABLE:
-            logger.warning("opensearch-py not available, OpenSearch disabled")
-            self.os = None
-            return
-            
-        # Get OpenSearch endpoint from environment variable (optional for development)
-        os_host = os.environ.get('OS_HOST')
-        if not os_host:
-            logger.warning("OS_HOST environment variable not set, OpenSearch disabled for development")
-            self.os = None
-            return
-        os_user = os.environ.get('OS_USER') or os.environ.get('OPENSEARCH_USER') or os.environ.get('ES_USER') or 'master'
-        os_pass = os.environ.get('OS_PASS') or os.environ.get('OPENSEARCH_PASS') or os.environ.get('ES_PASS') or 'Bugraid@123'
-        if os_host and os_user and os_pass:
-            try:
-                # Allow full URL or bare host
-                if os_host.startswith('http'):
-                    hosts = [os_host]
-                else:
-                    hosts = [{"host": os_host, "port": 443}]
-                self.os = OpenSearch(
-                    hosts=hosts,
-                    http_auth=(os_user, os_pass),
-                    use_ssl=True,
-                    verify_certs=True,
-                    ssl_assert_hostname=False,
-                )
-                logger.info("OpenSearch client initialized for timeline storage")
-            except Exception as e:
-                logger.warning(f"Failed to initialize OpenSearch client: {e}")
-        
         # Initialize Redis/Valkey client for incident correlation
         self.redis = None
-        if REDIS_AVAILABLE:
-            redis_host = os.environ.get('REDIS_HOST', 'localhost')
-            redis_port = int(os.environ.get('REDIS_PORT', 6379))
-            redis_username = os.environ.get('REDIS_USERNAME')
-            redis_password = os.environ.get('REDIS_PASSWORD')
+        redis_host = os.environ.get('REDIS_HOST', 'localhost')
+        redis_port = int(os.environ.get('REDIS_PORT', 6379))
+        redis_username = os.environ.get('REDIS_USERNAME')
+        redis_password = os.environ.get('REDIS_PASSWORD')
+        
+        if redis_host == 'localhost':
+            raise ValueError("REDIS_HOST must be set to a valid Valkey/Redis endpoint")
             
-            if redis_host != 'localhost':
+        try:
+            # Optimized connection parameters for regular Valkey cluster
+            connection_params = {
+                'host': redis_host,
+                'port': redis_port,
+                'socket_timeout': 5.0,  # Fast timeout for regular cluster
+                'socket_connect_timeout': 3.0,  # Fast connection timeout
+                'socket_keepalive': True,
+                'socket_keepalive_options': {},
+                'retry_on_timeout': True,
+                'retry_on_error': [redis.exceptions.ConnectionError, redis.exceptions.TimeoutError],
+                'decode_responses': True,
+                'health_check_interval': 30,  # Regular health checks
+                'max_connections': 10  # Standard connection pool
+            }
+            
+            # Add credentials if provided
+            if redis_username and redis_password:
+                connection_params.update({
+                    'username': redis_username,
+                    'password': redis_password
+                })
+            
+            # Create connection pool for better reliability
+            self.redis_pool = redis.ConnectionPool(**connection_params)
+            self.redis = redis.Redis(connection_pool=self.redis_pool)
+            
+            # Test Redis connection with quick retries for regular cluster
+            max_retries = 3
+            for attempt in range(max_retries):
                 try:
-                    if redis_username and redis_password:
-                        self.redis = redis.Redis(
-                            host=redis_host,
-                            port=redis_port,
-                            username=redis_username,
-                            password=redis_password,
-                            socket_timeout=5.0,
-                            socket_connect_timeout=5.0,
-                            retry_on_timeout=True,
-                            decode_responses=True
-                        )
-                    else:
-                        self.redis = redis.Redis(
-                            host=redis_host,
-                            port=redis_port,
-                            socket_timeout=5.0,
-                            socket_connect_timeout=5.0,
-                            retry_on_timeout=True,
-                            decode_responses=True
-                        )
-                    
-                    # Test Redis connection
                     self.redis.ping()
                     logger.info(f"Connected to Redis/Valkey at {redis_host}:{redis_port} for incident correlation")
-                except Exception as e:
-                    logger.warning(f"Failed to connect to Redis/Valkey at {redis_host}: {e}")
-                    self.redis = None
-            else:
-                logger.info(f"Skipping Redis connection with REDIS_HOST={redis_host}")
-        else:
-            logger.warning("redis library not available, incident correlation caching disabled")
-            
-        # Local cache for incidents when OpenSearch not available
+                    break
+                except Exception as retry_e:
+                    if attempt == max_retries - 1:
+                        # On final attempt, log warning but don't fail completely
+                        logger.warning(f"Failed to connect to Redis/Valkey at {redis_host} after {max_retries} attempts: {retry_e}")
+                        logger.warning("Continuing without Valkey correlation - incidents will be created individually")
+                        self.redis = None
+                        self.redis_pool = None
+                        break
+                else:
+                        logger.warning(f"Redis connection attempt {attempt + 1} failed: {retry_e}, retrying...")
+                        import time
+                        # Quick retry for regular cluster
+                        time.sleep(1)
+                        
+        except Exception as e:
+            logger.warning(f"Failed to initialize Redis/Valkey connection: {e}")
+            logger.warning("Continuing without Valkey correlation - incidents will be created individually")
+            self.redis = None
+        # Local cache for incidents (OpenSearch removed)
         self.local_incident_cache_path = os.environ.get('INCIDENT_CACHE_FILE', os.path.join('data', 'incidents_cache.json'))
         try:
             os.makedirs(os.path.dirname(self.local_incident_cache_path), exist_ok=True)
         except Exception:
             pass
-    
-    def check_for_existing_incident(self, alert: Dict) -> Optional[str]:
-        """Check Valkey for existing incidents that could correlate with this alert"""
+
+    def _ensure_redis_connection(self) -> bool:
+        """Ensure Redis connection is available, attempt reconnection if needed"""
         if not self.redis:
+            return False
+            
+        try:
+            self.redis.ping()
+            return True
+        except Exception as e:
+            logger.warning(f"Redis connection lost: {e}, attempting reconnection...")
+            # Try to reconnect once
+            try:
+                if hasattr(self, 'redis_pool') and self.redis_pool:
+                    self.redis = redis.Redis(connection_pool=self.redis_pool)
+                    self.redis.ping()
+                    logger.info("Redis reconnection successful")
+                    return True
+            except Exception as reconnect_e:
+                logger.warning(f"Redis reconnection failed: {reconnect_e}")
+                self.redis = None
+                return False
+
+    def _get_utc_timestamp(self) -> str:
+        """Get current UTC timestamp in proper ISO format with Z suffix"""
+        return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat().replace('+00:00', 'Z')
+    
+    def _safe_timestamp_to_iso(self, timestamp) -> str:
+        """Safely convert timestamp to ISO string format"""
+        if isinstance(timestamp, datetime):
+            return timestamp.isoformat() + 'Z'
+        elif isinstance(timestamp, str):
+            # If already a string, ensure it ends with Z
+            if not timestamp.endswith('Z'):
+                return timestamp + 'Z' if not timestamp.endswith('+00:00') else timestamp.replace('+00:00', 'Z')
+            return timestamp
+        else:
+            # Fallback to current time
+            return self._get_utc_timestamp()
+
+    async def send_incident_to_edal_jobs_queue(self, incident_data: Dict, environment: str) -> Optional[str]:
+        """Send incident information to edal-dev-jobs-queue for processing"""
+        try:
+            # Extract required information from incident data
+            company_slug = self.find_company_prefix(incident_data.get('bucket_name', ''), incident_data)
+            
+            # Create the incident payload for edal jobs queue
+            edal_incident = {
+                "Session_id": str(uuid.uuid4()),  # Generate a session ID
+                "incident_id": incident_data.get('incident_id', ''),
+                "title": incident_data.get('title', ''),
+                "service": incident_data.get('service', {}),
+                "service_id": incident_data.get('service_id', ''),
+                "source": incident_data.get('source', ''),
+                "description": incident_data.get('description', ''),
+                "priority": incident_data.get('priority', ''),
+                "urgency": incident_data.get('urgency', ''),
+                "priority_score": incident_data.get('priority_score', 0),
+                "compslug": company_slug,
+                "company_id": incident_data.get('company_id', ''),
+                "status": "triggered",
+                "created_at": incident_data.get('created_at', ''),
+                "updated_at": incident_data.get('updated_at', ''),
+                "first_alert_at": incident_data.get('first_alert_at', ''),
+                "last_alert_at": incident_data.get('last_alert_at', ''),
+                "environment": environment,
+            }
+            
+            # Send to edal jobs queue
+            response = self.sqs.send_message(
+                QueueUrl=self.edal_jobs_queue_url,
+                MessageBody=json.dumps(edal_incident),
+                MessageAttributes={
+                    'incident_id': {
+                        'StringValue': edal_incident['incident_id'],
+                        'DataType': 'String'
+                    },
+                    'environment': {
+                        'StringValue': environment,
+                        'DataType': 'String'
+                    },
+                    'message_type': {
+                        'StringValue': 'incident_job',
+                        'DataType': 'String'
+                    }
+                }
+            )
+            
+            message_id = response.get('MessageId')
+            logger.info(f"Successfully sent incident {edal_incident['incident_id']} to edal jobs queue: {message_id}")
+            return message_id
+            
+        except Exception as e:
+            logger.error(f"Failed to send incident to edal jobs queue: {e}")
+            return None
+
+    def check_for_existing_incident_valkey(self, alert: Dict) -> Optional[str]:
+        """Check Valkey for existing incidents that could correlate with this alert (replaces OpenSearch logic)"""
+        if not self._ensure_redis_connection():
             return None
             
         try:
-            # Create correlation key based on alert characteristics
+            # Create correlation key based on alert characteristics (same logic as OpenSearch)
             service = alert.get('service', '').lower()
             severity = alert.get('severity', '').lower()
             alert_type = alert.get('type', '').lower()
             source = alert.get('source', '').lower()
+            company_id = alert.get('company_id', '')
             
-            # Look for recent incidents with similar characteristics
+            # Look for recent incidents with similar characteristics (60 minute window)
             search_patterns = [
-                f"incident:*:service:{service}",
-                f"incident:*:severity:{severity}",
-                f"incident:*:type:{alert_type}",
-                f"incident:*:source:{source}"
+                f"incident:*:service:{service}:company:{company_id}",
+                f"incident:*:severity:{severity}:company:{company_id}",
+                f"incident:*:type:{alert_type}:company:{company_id}",
+                f"incident:*:source:{source}:company:{company_id}"
             ]
             
-            # Find incidents from last 15 minutes
-            cutoff_time = datetime.utcnow() - timedelta(minutes=15)
+            # Find incidents from last 60 minutes
+            cutoff_time = datetime.utcnow() - timedelta(minutes=60)
             
             for pattern in search_patterns:
-                incident_keys = self.redis.keys(pattern)
-                for key in incident_keys:
-                    incident_data = self.redis.hgetall(key)
-                    if incident_data:
-                        # Check if incident is recent
-                        created_time = datetime.fromisoformat(incident_data.get('created_at', '').rstrip('Z'))
-                        if created_time > cutoff_time:
-                            # Check for correlation based on similarity
-                            if self._are_alerts_similar(alert, json.loads(incident_data.get('representative_alert', '{}'))):
-                                incident_id = incident_data.get('incident_id')
-                                logger.info(f"Found correlating incident: {incident_id}")
-                                return incident_id
-                                
+                search_keys = self.redis.keys(pattern)
+                
+                for search_key in search_keys:
+                    # Get incident_id from the search key value
+                    incident_id = self.redis.get(search_key)
+                    
+                    if incident_id:
+                        # Get incident metadata using the incident_id
+                        incident_meta_key = f"incident:{incident_id}:meta"
+                        incident_data = self.redis.hgetall(incident_meta_key)
+                        
+                        if incident_data:
+                            # Check if incident is recent
+                            created_at = incident_data.get('created_at', '')
+                            
+                            if created_at:
+                                try:
+                                    created_time = datetime.fromisoformat(created_at.rstrip('Z'))
+                                    
+                                    if created_time > cutoff_time:
+                                        # Check for correlation based on similarity (same logic as OpenSearch)
+                                        representative_alert_json = incident_data.get('representative_alert', '{}')
+                                        representative_alert = json.loads(representative_alert_json)
+                                        
+                                        if self._are_alerts_similar_for_correlation(alert, representative_alert):
+                                            return incident_id
+                                except Exception:
+                                    continue
+            
+            return None
+                                 
         except Exception as e:
             logger.warning(f"Error checking for existing incidents in Valkey: {e}")
-            
-        return None
-    
-    def _are_alerts_similar(self, alert1: Dict, alert2: Dict) -> bool:
-        """Check if two alerts are similar enough to correlate"""
-        # Simple similarity check - can be enhanced with ML models
+            return None
+
+    def _are_alerts_similar_for_correlation(self, alert1: Dict, alert2: Dict) -> bool:
+        """Check if two alerts are similar enough to correlate (enhanced with title/message similarity)"""
         similarity_score = 0
         total_checks = 0
         
+        # Check company similarity first (critical for multi-tenant) - if different companies, no correlation
+        company1 = str(alert1.get('company_id', ''))
+        company2 = str(alert2.get('company_id', ''))
+        if company1 != company2:
+            return False  # Never correlate across different companies
+        
         # Check service similarity
-        if alert1.get('service') == alert2.get('service'):
-            similarity_score += 1
-        total_checks += 1
+        service1 = str(alert1.get('service', '')).lower()
+        service2 = str(alert2.get('service', '')).lower()
+        if service1 == service2:
+            similarity_score += 2  # Service match is important
+        total_checks += 2
+        
+        # Check title/message similarity (MOST IMPORTANT)
+        title1 = str(alert1.get('title', '')).lower().strip()
+        title2 = str(alert2.get('title', '')).lower().strip()
+        
+        # Exact title match
+        if title1 and title2 and title1 == title2:
+            similarity_score += 4  # Exact title match is very important
+        # Similar title (contains key words)
+        elif title1 and title2:
+            # Check if titles share significant words (excluding common words)
+            common_words = {'the', 'a', 'an', 'on', 'in', 'at', 'of', 'for', 'to', 'is', 'was', 'and', 'or'}
+            words1 = set(title1.split()) - common_words
+            words2 = set(title2.split()) - common_words
+            
+            if words1 and words2:
+                common_significant_words = words1.intersection(words2)
+                if len(common_significant_words) >= 2:  # At least 2 significant words in common
+                    similarity_score += 2
+                elif len(common_significant_words) >= 1:  # At least 1 significant word in common
+                    similarity_score += 1
+        total_checks += 4
         
         # Check severity similarity  
-        if alert1.get('severity') == alert2.get('severity'):
+        severity1 = str(alert1.get('severity', '')).lower()
+        severity2 = str(alert2.get('severity', '')).lower()
+        if severity1 == severity2:
             similarity_score += 1
         total_checks += 1
         
         # Check source similarity
-        if alert1.get('source') == alert2.get('source'):
+        source1 = str(alert1.get('source', '')).lower()
+        source2 = str(alert2.get('source', '')).lower()
+        if source1 == source2:
             similarity_score += 1
         total_checks += 1
         
         # Check alert type similarity
-        if alert1.get('type') == alert2.get('type'):
+        type1 = str(alert1.get('type', '')).lower()
+        type2 = str(alert2.get('type', '')).lower()
+        if type1 == type2:
             similarity_score += 1
         total_checks += 1
         
-        # Simple threshold - can be made configurable
+        # Calculate similarity ratio
         similarity_ratio = similarity_score / total_checks if total_checks > 0 else 0
-        return similarity_ratio >= 0.6  # 60% similarity threshold
-    
-    def add_alert_to_incident(self, alert: Dict, incident_id: str):
-        """Add an alert to an existing incident in Valkey"""
-        if not self.redis:
-            return
-            
-        try:
-            # Add alert to incident's alert list
-            alert_key = f"incident:{incident_id}:alerts"
-            self.redis.lpush(alert_key, json.dumps(alert))
-            
-            # Update incident metadata
-            incident_key = f"incident:{incident_id}:meta"
-            self.redis.hset(incident_key, "last_updated", datetime.utcnow().isoformat() + 'Z')
-            self.redis.hincrby(incident_key, "alert_count", 1)
-            
-            # Set expiration (24 hours)
-            self.redis.expire(alert_key, 86400)
-            self.redis.expire(incident_key, 86400)
-            
-            logger.info(f"Added alert to incident {incident_id} in Valkey")
-            
-        except Exception as e:
-            logger.warning(f"Error adding alert to incident in Valkey: {e}")
-    
-    def get_incident_alerts(self, incident_id: str) -> List[Dict]:
-        """Get all alerts for an incident from Valkey"""
-        if not self.redis:
-            return []
-            
-        try:
-            alert_key = f"incident:{incident_id}:alerts"
-            alert_jsons = self.redis.lrange(alert_key, 0, -1)
-            
-            alerts = []
-            for alert_json in alert_jsons:
-                try:
-                    alerts.append(json.loads(alert_json))
-                except json.JSONDecodeError:
-                    continue
-                    
-            return alerts
-            
-        except Exception as e:
-            logger.warning(f"Error getting incident alerts from Valkey: {e}")
-            return []
-    
+        
+        # Higher threshold (70%) to reduce over-correlation - requires stronger similarity
+        threshold = 0.7
+        is_similar = similarity_ratio >= threshold
+        
+        # Debug logging
+        logger.debug(f"Alert similarity check:")
+        logger.debug(f"  Alert1 title: '{title1}' | Alert2 title: '{title2}'")
+        logger.debug(f"  Alert1 service: '{service1}' | Alert2 service: '{service2}'")
+        logger.debug(f"  Score: {similarity_score}/{total_checks} = {similarity_ratio:.2f} ({'MATCH' if is_similar else 'NO MATCH'}, threshold={threshold})")
+        
+        return is_similar
+
     def create_incident_in_valkey(self, incident_id: str, alert: Dict):
-        """Create a new incident in Valkey"""
-        if not self.redis:
+        """Create a new incident in Valkey for future correlation"""
+        if not self._ensure_redis_connection():
             return
             
         try:
-            current_time = datetime.utcnow().isoformat() + 'Z'
+            current_time = self._get_utc_timestamp()
             
             # Store incident metadata
             incident_key = f"incident:{incident_id}:meta"
-            self.redis.hset(incident_key, {
-                "incident_id": incident_id,
-                "created_at": current_time,
-                "last_updated": current_time,
-                "alert_count": 1,
-                "status": "open",
-                "representative_alert": json.dumps(alert)
-            })
-            
-            # Store first alert
-            alert_key = f"incident:{incident_id}:alerts"
-            self.redis.lpush(alert_key, json.dumps(alert))
+            self.redis.hset(incident_key, "incident_id", incident_id)
+            self.redis.hset(incident_key, "created_at", current_time)
+            self.redis.hset(incident_key, "last_updated", current_time)
+            self.redis.hset(incident_key, "alert_count", 1)
+            self.redis.hset(incident_key, "status", "open")
+            self.redis.hset(incident_key, "representative_alert", json.dumps(alert))
             
             # Create searchable keys for correlation
             service = alert.get('service', '').lower()
             severity = alert.get('severity', '').lower()
             alert_type = alert.get('type', '').lower()
             source = alert.get('source', '').lower()
+            company_id = alert.get('company_id', '')
             
             search_keys = [
-                f"incident:{incident_id}:service:{service}",
-                f"incident:{incident_id}:severity:{severity}",
-                f"incident:{incident_id}:type:{alert_type}",
-                f"incident:{incident_id}:source:{source}"
+                f"incident:{incident_id}:service:{service}:company:{company_id}",
+                f"incident:{incident_id}:severity:{severity}:company:{company_id}",
+                f"incident:{incident_id}:type:{alert_type}:company:{company_id}",
+                f"incident:{incident_id}:source:{source}:company:{company_id}"
             ]
             
             for search_key in search_keys:
@@ -390,12 +457,30 @@ class EventCorrelationAgent:
                 
             # Set expiration (24 hours)
             self.redis.expire(incident_key, 86400)
-            self.redis.expire(alert_key, 86400)
             
             logger.info(f"Created incident {incident_id} in Valkey")
             
         except Exception as e:
             logger.warning(f"Error creating incident in Valkey: {e}")
+
+    def add_alert_to_incident_valkey(self, alert: Dict, incident_id: str):
+        """Add an alert to an existing incident in Valkey"""
+        if not self._ensure_redis_connection():
+            return
+            
+        try:
+            # Update incident metadata
+            incident_key = f"incident:{incident_id}:meta"
+            self.redis.hset(incident_key, "last_updated", self._get_utc_timestamp())
+            self.redis.hincrby(incident_key, "alert_count", 1)
+            
+            # Set expiration (24 hours)
+            self.redis.expire(incident_key, 86400)
+            
+            logger.info(f"Updated incident {incident_id} metadata in Valkey")
+            
+        except Exception as e:
+            logger.warning(f"Error updating incident metadata in Valkey: {e}")
 
     async def send_to_queue(self, message: Dict, queue_type: str, environment: Optional[str] = None) -> Optional[str]:
         """Send a message to the appropriate SQS queue and return MessageId on success."""
@@ -480,63 +565,18 @@ class EventCorrelationAgent:
             return None
 
     def _index_timeline_event(self, incident_id: str, event: Dict[str, Any]) -> Optional[str]:
-        """Append a correlation event onto the incident document in OpenSearch (single doc per incident)."""
-        if self.os is None:
-            logger.warning("OpenSearch client not initialized; skipping timeline indexing")
-            return None
-        try:
-            now_iso = datetime.utcnow().isoformat() + 'Z'
-            update_body = {
-                "script": {
-                    "lang": "painless",
-                    "source": (
-                        "if (ctx._source.correlation == null) { ctx._source.correlation = new ArrayList(); } "
-                        "ctx._source.correlation.add(params.event); "
-                        "ctx._source.updated_at = params.now;"
-                    ),
-                    "params": {"event": event, "now": now_iso}
-                },
-                "upsert": {
-                    "id": incident_id,
-                    "incident_id": incident_id,
-                    "doc_kind": "incident",
-                    "correlation": [event],
-                    "created_at": now_iso,
-                    "updated_at": now_iso
-                }
-            }
-            resp = self.os.update(index=self.os_index, id=incident_id, body=update_body, refresh=True)
-            logger.info(f"Appended correlation event to incident {incident_id} in OpenSearch")
-            return resp.get('_id', incident_id)
-        except os_exceptions.OpenSearchException as e:
-            logger.error(f"OpenSearch error indexing timeline: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"Error indexing timeline: {e}")
-            return None
+        """Log timeline event (OpenSearch removed - using debug logs only)."""
+        # OpenSearch removed - using debug logs only
+        logger.debug(f"Timeline event for incident {incident_id}: {event}")
+        return incident_id
 
     def _index_incident_document(self, incident: Dict[str, Any]) -> Optional[str]:
-        """Index or upsert the incident document in OpenSearch (doc_kind=incident)."""
-        if self.os is None:
-            return None
-        try:
-            body = {"doc_kind": "incident", **incident}
-            resp = self.os.index(index=self.os_index, id=incident.get("id"), body=body, refresh=True)
-            return resp.get("_id")
-        except Exception as e:
-            logger.warning(f"Failed to index incident to OpenSearch: {e}")
-            return None
+        """Index incident document (OpenSearch removed - using debug logs only)."""
+        logger.debug(f"Incident document: {incident.get('id')}")
+        return incident.get("id")
 
     def _fetch_incident_document(self, incident_id: str) -> Optional[Dict[str, Any]]:
-        # Try OpenSearch first
-        if self.os is not None:
-            try:
-                resp = self.os.get(index=self.os_index, id=incident_id, ignore=[404])
-                if resp and resp.get("found"):
-                    return resp.get("_source")
-            except Exception as e:
-                logger.warning(f"Failed to fetch incident {incident_id} from OpenSearch: {e}")
-        # Fallback to local cache
+        """Fetch incident document (OpenSearch removed - using local cache only)."""
         try:
             if os.path.exists(self.local_incident_cache_path):
                 with open(self.local_incident_cache_path, 'r') as f:
@@ -559,7 +599,7 @@ class EventCorrelationAgent:
             "description": alert.get("description", ""),
             "alert_item_id": alert.get("id"),
             "trigger": alert.get("trigger"),
-            "created_at": alert.get("createdAt") or (alert.get("parsed_time").isoformat()+"Z" if alert.get("parsed_time") else None),
+            "created_at": alert.get("createdAt") or (self._safe_timestamp_to_iso(alert.get("parsed_time")) if alert.get("parsed_time") else None),
             "updated_at": alert.get("updatedAt"),
             "sources": alert.get("sources"),
             "policy_names": alert.get("alertPolicyNames"),
@@ -569,10 +609,17 @@ class EventCorrelationAgent:
 
     async def _update_incident_with_alerts(self, incident_id: str, new_alerts: List[Dict[str, Any]], environment: str) -> Optional[Dict[str, Any]]:
         """Append alerts to an existing incident, promote to correlated, update counters/timestamps, reindex and notify SQS."""
-        existing = self._fetch_incident_document(incident_id)
-        if not existing:
-            logger.warning(f"Existing incident {incident_id} not found in OpenSearch for update")
-            return None
+        # Since we removed OpenSearch, create a minimal incident structure for correlation
+        existing = {
+            "id": incident_id,
+            "data": {
+                "alerts": [],
+                "total_alerts": 1,
+                "status": "triggered"
+            },
+            "created_at": self._get_utc_timestamp(),
+            "updated_at": self._get_utc_timestamp()
+        }
         try:
             # Build alert items and deduplicate by alert_item_id
             new_items = [self._build_alert_item(a) for a in new_alerts]
@@ -594,7 +641,9 @@ class EventCorrelationAgent:
                 if t:
                     times.append(t)
             if times:
-                last_alert_at = max(times).isoformat() + 'Z'
+                # Find the latest timestamp from the times array
+                latest_time = max(times)
+                last_alert_at = self._safe_timestamp_to_iso(latest_time)
 
             updated = {**existing}
             updated["is_correlated"] = True
@@ -620,6 +669,7 @@ class EventCorrelationAgent:
                         json.dump(cache, f)
                 except Exception as e:
                     logger.warning(f"Failed to persist updated incident to local cache: {e}")
+            
                         # For updates, only send the new alerts data
             try:
                 update_payload = {
@@ -1156,139 +1206,29 @@ class EventCorrelationAgent:
     
     async def enhanced_incident_matching(self, title: str, service: str, company_id: str, 
                                        group_alerts: List[Dict], environment: str) -> Optional[str]:
-        """Match alerts with existing incidents within a time window using OpenSearch lookback."""
+        """Match alerts with existing incidents within a time window using Valkey lookback (replaces OpenSearch)."""
         try:
             logger.info(f"\n🔍 Searching for existing incidents to match with:")
             logger.info(f"   Title: {title}")
             logger.info(f"   Service: {service}")
             logger.info(f"   Company: {company_id}")
-            all_items = []
-
-            # Query OpenSearch for recent incidents
-            if company_id:
-                try:
-                    max_time_window_minutes = 60
-                    time_window_minutes = min(self.time_window_minutes, max_time_window_minutes)
-                    cutoff_time = (datetime.utcnow() - timedelta(minutes=time_window_minutes)).isoformat() + 'Z'
-                    # Prefer exact service_id if we can derive it from alerts
-                    service_id = None
-                    for a in group_alerts:
-                        if a.get('service_id'):
-                            service_id = a['service_id']
-                            break
-                    service_str = (service or '').lower()
-                    # Try OpenSearch first
-                    if self.os is not None:
-                        try:
-                            must_filters = [
-                                {"term": {"doc_kind": "incident"}},
-                                {"term": {"company_id": company_id}},
-                                {"range": {"last_alert_at": {"gte": cutoff_time}}}
-                            ]
-                            if service_id:
-                                must_filters.append({"term": {"service_id": service_id}})
-                            query = {"bool": {"must": must_filters}}
-                            resp = self.os.search(index=self.os_index, body={
-                                "size": 25,
-                                "query": query,
-                                "sort": [{"last_alert_at": {"order": "desc"}}]
-                            })
-                            hits = resp.get('hits', {}).get('hits', [])
-                            for h in hits:
-                                src = h.get('_source') or {}
-                                all_items.append(src)
-                        except Exception as e:
-                            logger.warning(f"OpenSearch incident lookback failed: {e}")
-                    # Fallback to local cache if OS not configured or failed
-                    if not all_items and os.path.exists(self.local_incident_cache_path):
-                        try:
-                            with open(self.local_incident_cache_path, 'r') as f:
-                                cache = json.load(f) or []
-                            for inc in cache:
-                                if inc.get('company_id') != company_id:
-                                    continue
-                                if service_id and inc.get('service_id') != service_id:
-                                    continue
-                                # Filter cutoff
-                                la = inc.get('last_alert_at') or inc.get('created_at')
-                                if la and la >= cutoff_time:
-                                    all_items.append(inc)
-                        except Exception as e:
-                            logger.warning(f"Local cache incident lookback failed: {e}")
-                except Exception as e:
-                    logger.warning(f"OpenSearch incident lookback failed: {e}")
             
-            # Calculate time window for matching (default 15 minutes, max 60 minutes)
-            max_time_window_minutes = 60  # Maximum time window in minutes
-            time_window_minutes = min(self.time_window_minutes, max_time_window_minutes)
+            # Use first alert from group for Valkey matching
+            if group_alerts:
+                first_alert = group_alerts[0].copy()
+                first_alert['company_id'] = company_id
+                first_alert['service'] = service
+                
+                # Check Valkey for existing incidents using our new method
+                matching_incident = self.check_for_existing_incident_valkey(first_alert)
+                
+                if matching_incident:
+                    logger.info(f"✅ Found matching incident in Valkey: {matching_incident}")
+                    return matching_incident
+                else:
+                    logger.info(f"🚫 No matching incident found in Valkey")
             
-            # Get current time and calculate cutoff time
-            current_time = datetime.utcnow()
-            cutoff_time = current_time - timedelta(minutes=time_window_minutes)
-            cutoff_time_str = cutoff_time.isoformat() + 'Z'
-            
-            logger.info(f"   Time window: {time_window_minutes} minutes (incidents after {cutoff_time_str})")
-            
-            logger.info(f"Found {len(all_items)} recent existing incidents for company {company_id} within the time window")
-            
-            if not all_items:
                 return None
-            
-            # Score incidents for matching
-            best_match = None
-            best_score = 0
-            
-            for incident in all_items:
-                incident_id = incident.get('id', '')
-                incident_title = (incident.get('title') or '').lower()
-                incident_service_id = (incident.get('service_id') or '').lower()
-                incident_service_name = ((incident.get('service') or {}).get('name') or '').lower()
-                incident_created_at = incident.get('created_at', '')
-                
-                # Skip incidents outside the time window (additional safety check)
-                if incident_created_at:
-                    try:
-                        incident_time = datetime.fromisoformat(incident_created_at.rstrip('Z'))
-                        if incident_time < cutoff_time:
-                            logger.debug(f"Skipping incident {incident_id} - outside time window")
-                            continue
-                    except (ValueError, TypeError):
-                        # If we can't parse the time, still include the incident
-                        pass
-                
-                # Calculate title similarity
-                title_lower = title.lower()
-                title_similarity = 0
-                if incident_title and title_lower:
-                    # Simple word overlap scoring
-                    title_words = set(title_lower.split())
-                    incident_words = set(incident_title.split())
-                    if title_words and incident_words:
-                        common_words = title_words.intersection(incident_words)
-                        title_similarity = len(common_words) / max(len(title_words), len(incident_words))
-                
-                # Service similarity (match by id or by name)
-                svc_name = (service or '').lower()
-                service_similarity = 0.0
-                if service_id and incident_service_id and incident_service_id == service_id:
-                    service_similarity = 1.0
-                elif svc_name and incident_service_name and (
-                    svc_name == incident_service_name or svc_name in incident_service_name or incident_service_name in svc_name
-                ):
-                    service_similarity = 1.0
-                
-                # Calculate total similarity
-                total_similarity = (title_similarity * 0.7) + (service_similarity * 0.3)
-                
-                if total_similarity > best_score and total_similarity > 0.5:  # Threshold for matching
-                    best_match = incident_id
-                    best_score = total_similarity
-                    logger.info(f"   Match candidate: {incident_id} (score: {total_similarity:.2f}, created: {incident_created_at})")
-            
-            if best_match:
-                logger.info(f"✅ Found matching incident: {best_match} (score: {best_score:.2f})")
-            
-            return best_match
             
         except Exception as e:
             logger.error(f"Error in incident matching: {e}")
@@ -1347,16 +1287,7 @@ class EventCorrelationAgent:
                 urgency = "low"
             
             # Calculate time range
-            alert_times = []
-            for alert in group_alerts:
-                parsed_time = alert.get('parsed_time')
-                if parsed_time:
-                    if isinstance(parsed_time, str):
-                        try:
-                            parsed_time = datetime.fromisoformat(parsed_time.rstrip('Z'))
-                        except Exception:
-                            parsed_time = datetime.utcnow()
-                    alert_times.append(parsed_time)
+            alert_times = [alert.get('parsed_time') for alert in group_alerts if alert.get('parsed_time')]
             first_alert_time = min(alert_times) if alert_times else datetime.utcnow()
             last_alert_time = max(alert_times) if alert_times else datetime.utcnow()
             
@@ -1365,18 +1296,9 @@ class EventCorrelationAgent:
                 pr = (alert.get('priority') or alert.get('severity') or '').lower()
                 mapping = {'p0':5,'critical':5,'p1':4,'high':4,'p2':3,'medium':3,'p3':2,'low':2,'p4':1}
                 return mapping.get(pr, 3)
-            def _get_alert_time(alert):
-                parsed_time = alert.get('parsed_time', datetime.utcnow())
-                if isinstance(parsed_time, str):
-                    try:
-                        return datetime.fromisoformat(parsed_time.rstrip('Z'))
-                    except Exception:
-                        return datetime.utcnow()
-                return parsed_time
-            
             sorted_alerts = sorted(
                 group_alerts,
-                key=lambda a: (-_priority_rank(a), _get_alert_time(a))
+                key=lambda a: (-_priority_rank(a), a.get('parsed_time') or datetime.utcnow())
             )
             primary_alert = sorted_alerts[0]
             
@@ -1414,10 +1336,10 @@ class EventCorrelationAgent:
                 "bucket_name": bucket_name,
                 "status": "triggered",
                 "is_correlated": True,
-                "created_at": first_alert_time.isoformat() + 'Z',
-                "updated_at": last_alert_time.isoformat() + 'Z',
-                "first_alert_at": first_alert_time.isoformat() + 'Z',
-                "last_alert_at": last_alert_time.isoformat() + 'Z',
+                "created_at": self._safe_timestamp_to_iso(first_alert_time),
+                "updated_at": self._safe_timestamp_to_iso(last_alert_time),
+                "first_alert_at": self._safe_timestamp_to_iso(first_alert_time),
+                "last_alert_at": self._safe_timestamp_to_iso(last_alert_time),
                 "alert_count": len(group_alerts),
                 "correlation_method": "dbscan",
                 "environment": environment,
@@ -1437,7 +1359,14 @@ class EventCorrelationAgent:
             # Trigger log fetcher lambda for the new incident
             await self._trigger_log_fetcher(incident_id, environment)
             
-            # Index incident into OpenSearch for future cross-run correlation or persist locally
+            # Send incident to edal jobs queue
+            await self.send_incident_to_edal_jobs_queue(incident, environment)
+            
+            # Store incident in Valkey for future correlation (use representative alert)
+            representative_alert = group_alerts[0]  # Use first alert as representative
+            self.create_incident_in_valkey(incident_id, representative_alert)
+            
+            # Persist incident locally (OpenSearch removed)
             if not self._index_incident_document(incident):
                 try:
                     # append to local cache
@@ -1452,7 +1381,7 @@ class EventCorrelationAgent:
                 except Exception as e:
                     logger.warning(f"Failed to persist incident to local cache: {e}")
             
-            # Store timeline entries in OpenSearch (do not send to SQS)
+            # Store timeline entries (OpenSearch removed - using debug logs only)
             for alert in group_alerts:
                 timeline_entry = {
                     "id": str(uuid.uuid4()),
@@ -1539,14 +1468,7 @@ class EventCorrelationAgent:
                 priority = "medium"
                 urgency = "low"
             
-            # Handle parsed_time being either datetime or string
             alert_time = alert.get('parsed_time', datetime.utcnow())
-            if isinstance(alert_time, str):
-                try:
-                    # Parse ISO format timestamp
-                    alert_time = datetime.fromisoformat(alert_time.rstrip('Z'))
-                except Exception:
-                    alert_time = datetime.utcnow()
             
             # Create incident record
             incident = {
@@ -1566,10 +1488,10 @@ class EventCorrelationAgent:
                 "bucket_name": bucket_name,
                 "status": "triggered",
                 "is_correlated": False,
-                "created_at": alert_time.isoformat() + 'Z',
-                "updated_at": alert_time.isoformat() + 'Z',
-                "first_alert_at": alert_time.isoformat() + 'Z',
-                "last_alert_at": alert_time.isoformat() + 'Z',
+                "created_at": self._safe_timestamp_to_iso(alert_time),
+                "updated_at": self._safe_timestamp_to_iso(alert_time),
+                "first_alert_at": self._safe_timestamp_to_iso(alert_time),
+                "last_alert_at": self._safe_timestamp_to_iso(alert_time),
                 "alert_count": 1,
                 "correlation_method": "single_alert",
                 "environment": environment,
@@ -1585,7 +1507,13 @@ class EventCorrelationAgent:
             # Trigger log fetcher lambda for the new incident
             await self._trigger_log_fetcher(incident_id, environment)
 
-            # Index incident into OpenSearch for future cross-run correlation or persist locally
+            # Send incident to edal jobs queue
+            await self.send_incident_to_edal_jobs_queue(incident, environment)
+
+            # Store incident in Valkey for future correlation
+            self.create_incident_in_valkey(incident_id, alert)
+
+            # Persist incident locally (OpenSearch removed)
             if not self._index_incident_document(incident):
                 try:
                     cache = []
@@ -1656,6 +1584,8 @@ class EventCorrelationAgent:
                 if existing_incident:
                     logger.info(f"Alert {alert.get('id')} matched to existing incident {existing_incident}")
                     alert['correlated_incident_id'] = existing_incident
+                    # Add alert to incident in Valkey
+                    self.add_alert_to_incident_valkey(alert, existing_incident)
                     # Promote/update existing incident with this alert
                     updated = await self._update_incident_with_alerts(existing_incident, [alert], environment)
                     if updated:
@@ -1717,6 +1647,8 @@ class EventCorrelationAgent:
                         if existing_incident:
                             logger.info(f"Alert {alert.get('id')} matched to existing incident {existing_incident}")
                             alert['correlated_incident_id'] = existing_incident
+                            # Add alert to incident in Valkey
+                            self.add_alert_to_incident_valkey(alert, existing_incident)
                         else:
                             incident_id = await self.save_single_incident(alert, bucket_name, environment)
                             single_incident_ids.append(incident_id)
@@ -1740,6 +1672,8 @@ class EventCorrelationAgent:
                             logger.info(f"Cluster {cluster_idx + 1} matched to existing incident {existing_incident}")
                             for alert in cluster_alerts:
                                 alert['correlated_incident_id'] = existing_incident
+                                # Add each alert to incident in Valkey
+                                self.add_alert_to_incident_valkey(alert, existing_incident)
                             # Promote/update existing incident with these alerts
                             updated = await self._update_incident_with_alerts(existing_incident, cluster_alerts, environment)
                             if updated:
@@ -1831,6 +1765,157 @@ class EventCorrelationAgent:
             logger.error(f"Error triggering log fetcher for incident {incident_id}: {str(e)}")
             logger.error(f"Exception details: {str(type(e))}")
             # Don't raise the exception as this shouldn't block incident creation
+
+# Correlation node function for LangGraph
+async def correlation_node(state: WorkflowState) -> WorkflowState:
+    """Main correlation logic - uses Valkey for existing incident matching"""
+    try:
+        alerts = state["alerts"]
+        environment = state["environment"]
+        source = state["source"]
+        
+        logger.info(f"Starting event correlation on {len(alerts)} alerts from {source} in {environment}")
+        
+        # Initialize correlation agent
+        agent = EventCorrelationAgent()
+        logger.info(f"Correlation agent initialized with Valkey")
+        
+        # Preserve original alert sources, but ensure source field exists
+        for alert in alerts:
+            if not alert.get('source'):
+                alert['source'] = source  # Only set source if it's missing
+        
+        # Use the existing correlate_events method which now uses Valkey
+        correlated_ids, single_ids, stats = await agent.correlate_events(alerts, environment)
+        
+        # Convert to incident clusters for response
+        incident_clusters = []
+        
+        # Add correlated incidents
+        for incident_id in correlated_ids:
+            incident_clusters.append({
+                "incident_id": incident_id,
+                "alerts": [],  # Not storing individual alerts in clusters for efficiency
+                "cluster_size": 1,  # Will be updated by actual correlation
+                "representative_alert": alerts[0] if alerts else {},
+                "created_timestamp": agent._get_utc_timestamp()
+            })
+        
+        # Add single incidents
+        for incident_id in single_ids:
+            incident_clusters.append({
+                "incident_id": incident_id,
+                "alerts": [],
+                "cluster_size": 1,
+                "representative_alert": alerts[0] if alerts else {},
+                "created_timestamp": agent._get_utc_timestamp()
+            })
+        
+        state["incident_clusters"] = incident_clusters
+        state["total_incidents"] = len(incident_clusters)
+        state["messages"].append({
+            "role": "system", 
+            "content": f"Created {len(incident_clusters)} incidents from {len(alerts)} alerts using Valkey correlation"
+        })
+        
+        logger.info(f"Correlation complete: {len(incident_clusters)} incidents created")
+        return state
+        
+    except Exception as e:
+        logger.error(f"Error in correlation_node: {e}")
+        state["error"] = str(e)
+        return state
+
+# Create LangGraph workflow
+def create_correlation_workflow():
+    workflow = StateGraph(WorkflowState)
+    
+    # Add nodes
+    workflow.add_node("correlation", correlation_node)
+    
+    # Add edges
+    workflow.add_edge("__start__", "correlation")
+    workflow.add_edge("correlation", "__end__")
+    
+    return workflow.compile()
+
+# FastAPI lifespan
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info("Starting Clustering Correlation API with Valkey")
+    yield
+    # Shutdown
+    logger.info("Clustering Correlation API shutdown complete")
+
+# FastAPI app
+app = FastAPI(
+    title="Clustering Correlation API",
+    description="FastAPI service for alert correlation and incident creation using LangGraph workflows with Valkey",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "service": "clustering-correlation",
+        "valkey_enabled": True,
+        "timestamp": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat().replace('+00:00', 'Z')
+    }
+
+@app.post("/correlate-alerts", response_model=CorrelationResponse)
+async def correlate_alerts(request: CorrelationRequest, background_tasks: BackgroundTasks):
+    """Correlate alerts and create incidents using Valkey"""
+    try:
+        start_time = datetime.utcnow()
+        
+        # Create workflow
+        workflow = create_correlation_workflow()
+        
+        # Initial state
+        initial_state = WorkflowState(
+            alerts=request.alerts,
+            environment=request.environment,
+            source=request.source,
+            incident_clusters=[],
+            total_incidents=0,
+            messages=[],
+            error=None
+        )
+        
+        # Run workflow
+        result = await workflow.ainvoke(initial_state)
+        
+        if result.get("error"):
+            raise HTTPException(status_code=500, detail=result["error"])
+        
+        processing_time = (datetime.utcnow() - start_time).total_seconds() * 1000
+        
+        # Convert to response format
+        incident_clusters = []
+        for cluster in result["incident_clusters"]:
+            incident_clusters.append(IncidentCluster(
+                incident_id=cluster["incident_id"],
+                alerts=cluster["alerts"],
+                cluster_size=cluster["cluster_size"],
+                representative_alert=cluster["representative_alert"],
+                created_timestamp=cluster["created_timestamp"]
+            ))
+        
+        return CorrelationResponse(
+            incident_clusters=incident_clusters,
+            total_incidents=result["total_incidents"],
+            total_alerts_processed=len(request.alerts),
+            processing_time_ms=processing_time,
+            timestamp=datetime.utcnow().isoformat() + "Z"
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in correlation: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Example usage and testing
 async def main(state=None):
@@ -1984,229 +2069,6 @@ async def main(state=None):
                 "error": str(e)
             }
         }
-
-# Initialize service (will be created when needed)
-correlation_service = None
-
-def get_correlation_service():
-    """Get or create correlation service instance"""
-    global correlation_service
-    if correlation_service is None:
-        correlation_service = EventCorrelationAgent()
-    return correlation_service
-
-# LangGraph workflow definition
-async def correlation_node(state: WorkflowState) -> WorkflowState:
-    """Node to correlate alerts and create incidents"""
-    try:
-        alerts = state["alerts"]
-        environment = state["environment"]
-        
-        # Apply correlation
-        correlated_ids, single_ids, stats = await get_correlation_service().correlate_events(alerts, environment)
-        
-        # Create incident clusters
-        incident_clusters = []
-        
-        # Group alerts by incident_id
-        incident_alerts = defaultdict(list)
-        for alert in alerts:
-            incident_id = alert.get('correlated_incident_id')
-            if incident_id:
-                incident_alerts[incident_id].append(alert)
-        
-        # Create incident cluster objects
-        for incident_id, incident_alert_list in incident_alerts.items():
-            if incident_alert_list:
-                representative_alert = incident_alert_list[0]  # First alert as representative
-                incident_clusters.append({
-                    "incident_id": incident_id,
-                    "alerts": incident_alert_list,
-                    "cluster_size": len(incident_alert_list),
-                    "representative_alert": representative_alert,
-                    "created_timestamp": datetime.utcnow().isoformat() + 'Z'
-                })
-        
-        state["incident_clusters"] = incident_clusters
-        state["total_incidents"] = len(incident_clusters)
-        state["messages"].append({"role": "system", "content": f"Created {len(incident_clusters)} incidents from {len(alerts)} alerts"})
-        return state
-    except Exception as e:
-        state["error"] = str(e)
-        return state
-
-# Correlation node function for LangGraph
-def correlation_node(state: WorkflowState) -> WorkflowState:
-    """Main correlation logic - checks Valkey for existing incidents and correlates alerts"""
-    try:
-        alerts = state["alerts"]
-        environment = state["environment"]
-        source = state["source"]
-        
-        logger.info(f"Starting event correlation on {len(alerts)} alerts from {source} in {environment}")
-        
-        # Initialize correlation agent
-        agent = EventCorrelationAgent()
-        
-        # Check Valkey for existing incidents and correlate
-        incident_clusters = []
-        processed_alerts = []
-        
-        for alert in alerts:
-            # Check if this alert can be correlated with existing incidents in Valkey
-            existing_incident_id = agent.check_for_existing_incident(alert)
-            
-            if existing_incident_id:
-                # Add alert to existing incident
-                logger.info(f"Correlating alert with existing incident: {existing_incident_id}")
-                agent.add_alert_to_incident(alert, existing_incident_id)
-                
-                # Find or create cluster for this incident
-                cluster_found = False
-                for cluster in incident_clusters:
-                    if cluster["incident_id"] == existing_incident_id:
-                        cluster["alerts"].append(alert)
-                        cluster["cluster_size"] = len(cluster["alerts"])
-                        cluster_found = True
-                        break
-                
-                if not cluster_found:
-                    # Load existing incident from Valkey
-                    existing_alerts = agent.get_incident_alerts(existing_incident_id)
-                    incident_clusters.append({
-                        "incident_id": existing_incident_id,
-                        "alerts": existing_alerts + [alert],
-                        "cluster_size": len(existing_alerts) + 1,
-                        "representative_alert": existing_alerts[0] if existing_alerts else alert,
-                        "created_timestamp": datetime.utcnow().isoformat() + 'Z'
-                    })
-            else:
-                # Create new incident for this alert
-                incident_id = str(uuid.uuid4())
-                logger.info(f"Creating new incident: {incident_id}")
-                
-                # Store new incident in Valkey
-                agent.create_incident_in_valkey(incident_id, alert)
-                
-                # Add to clusters
-                incident_clusters.append({
-                    "incident_id": incident_id,
-                    "alerts": [alert],
-                    "cluster_size": 1,
-                    "representative_alert": alert,
-                    "created_timestamp": datetime.utcnow().isoformat() + 'Z'
-                })
-            
-            processed_alerts.append(alert)
-        
-        # Send incidents to SQS
-        for cluster in incident_clusters:
-            agent.save_incident(cluster["alerts"], cluster["incident_id"])
-        
-        state["incident_clusters"] = incident_clusters
-        state["total_incidents"] = len(incident_clusters)
-        state["messages"].append({
-            "role": "system", 
-            "content": f"Created {len(incident_clusters)} incidents from {len(alerts)} alerts using Valkey correlation"
-        })
-        
-        logger.info(f"Correlation complete: {len(incident_clusters)} incidents created")
-        return state
-        
-    except Exception as e:
-        logger.error(f"Error in correlation_node: {e}")
-        state["error"] = str(e)
-        return state
-
-# Create LangGraph workflow
-def create_correlation_workflow():
-    workflow = StateGraph(WorkflowState)
-    
-    # Add nodes
-    workflow.add_node("correlation", correlation_node)
-    
-    # Add edges
-    workflow.add_edge("__start__", "correlation")
-    workflow.add_edge("correlation", "__end__")
-    
-    return workflow.compile()
-
-# FastAPI lifespan
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup
-    logger.info("Starting Clustering Correlation API")
-    yield
-    # Shutdown
-    logger.info("Clustering Correlation API shutdown complete")
-
-# FastAPI app
-app = FastAPI(
-    title="Clustering Correlation API",
-    description="FastAPI service for alert correlation and incident creation using LangGraph workflows",
-    version="1.0.0",
-    lifespan=lifespan
-)
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "service": "clustering-correlation",
-        "timestamp": datetime.utcnow().isoformat() + "Z"
-    }
-
-@app.post("/correlate-alerts", response_model=CorrelationResponse)
-async def correlate_alerts(request: CorrelationRequest, background_tasks: BackgroundTasks):
-    """Correlate alerts and create incidents"""
-    try:
-        start_time = datetime.utcnow()
-        
-        # Create workflow
-        workflow = create_correlation_workflow()
-        
-        # Initial state
-        initial_state = WorkflowState(
-            alerts=request.alerts,
-            environment=request.environment,
-            source=request.source,
-            incident_clusters=[],
-            total_incidents=0,
-            messages=[],
-            error=None
-        )
-        
-        # Run workflow
-        result = await workflow.ainvoke(initial_state)
-        
-        if result.get("error"):
-            raise HTTPException(status_code=500, detail=result["error"])
-        
-        processing_time = (datetime.utcnow() - start_time).total_seconds() * 1000
-        
-        # Convert to response format
-        incident_clusters = []
-        for cluster in result["incident_clusters"]:
-            incident_clusters.append(IncidentCluster(
-                incident_id=cluster["incident_id"],
-                alerts=cluster["alerts"],
-                cluster_size=cluster["cluster_size"],
-                representative_alert=cluster["representative_alert"],
-                created_timestamp=cluster["created_timestamp"]
-            ))
-        
-        return CorrelationResponse(
-            incident_clusters=incident_clusters,
-            total_incidents=result["total_incidents"],
-            total_alerts_processed=len(request.alerts),
-            processing_time_ms=processing_time,
-            timestamp=datetime.utcnow().isoformat() + "Z"
-        )
-        
-    except Exception as e:
-        logger.error(f"Error in correlation: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
