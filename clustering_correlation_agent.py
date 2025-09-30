@@ -2,6 +2,7 @@ import json
 import boto3
 import asyncio
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
@@ -15,6 +16,9 @@ import logging
 import uuid
 import re
 import redis
+import redis.asyncio
+import ssl
+import certifi
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -70,8 +74,7 @@ class EventCorrelationAgent:
         # Initialize SQS client instead of DynamoDB
         self.sqs = boto3.client('sqs')
         
-        # Initialize Lambda client for triggering log fetcher
-        self.lambda_client = boto3.client('lambda')
+        # Lambda client removed - log fetcher not needed
         # Prefer config/env over hardcoded; default to provided queue URL
         self.sqs_queue_url = (
             (self.config.get('sqs') or {}).get('queue_url')
@@ -95,8 +98,9 @@ class EventCorrelationAgent:
             }
         }
         
-        # Additional SQS queue for incident job processing
-        self.edal_jobs_queue_url = "https://sqs.ap-southeast-1.amazonaws.com/528104389666/edal-dev-jobs-queue"
+        # Additional SQS queues for incident job processing
+        self.edal_jobs_queue_url = "https://sqs.ap-southeast-1.amazonaws.com/528104389666/edal-dev-jobs-queue.fifo"
+        self.context_fetcher_queue_url = "https://sqs.ap-southeast-1.amazonaws.com/528104389666/context-fetcher-queue.fifo"
         
         # Configuration parameters
         self.time_window_minutes = self.config.get('time_window_minutes', 15)
@@ -121,63 +125,71 @@ class EventCorrelationAgent:
         # Track SQS acknowledgements by queue type
         self._sqs_acks: Dict[str, List[str]] = {"incidents": [], "timelines": [], "counters": []}
 
-        # Initialize Redis/Valkey client for incident correlation
+        # Initialize Redis/Valkey client for incident correlation (deferred to startup)
         self.redis = None
-        redis_host = os.environ.get('REDIS_HOST', 'localhost')
-        redis_port = int(os.environ.get('REDIS_PORT', 6379))
-        redis_username = os.environ.get('REDIS_USERNAME')
-        redis_password = os.environ.get('REDIS_PASSWORD')
+        self.redis_pool = None
+        self.redis_host = os.environ.get('REDIS_HOST', 'localhost')
+        self.redis_port = int(os.environ.get('REDIS_PORT', 6379))
+        self.redis_username = os.environ.get('REDIS_USERNAME')
+        self.redis_password = os.environ.get('REDIS_PASSWORD')
         
-        if redis_host == 'localhost':
-            raise ValueError("REDIS_HOST must be set to a valid Valkey/Redis endpoint")
+        if self.redis_host == 'localhost':
+            logger.warning("REDIS_HOST not configured, Redis/Valkey will be disabled")
             
         try:
-            # Optimized connection parameters for regular Valkey cluster
-            connection_params = {
-                'host': redis_host,
-                'port': redis_port,
-                'socket_timeout': 5.0,  # Fast timeout for regular cluster
-                'socket_connect_timeout': 3.0,  # Fast connection timeout
-                'socket_keepalive': True,
-                'socket_keepalive_options': {},
-                'retry_on_timeout': True,
-                'retry_on_error': [redis.exceptions.ConnectionError, redis.exceptions.TimeoutError],
-                'decode_responses': True,
-                'health_check_interval': 30,  # Regular health checks
-                'max_connections': 10  # Standard connection pool
-            }
+            # For serverless Valkey, use proper TLS configuration
+            if self.redis_host != 'localhost':
+                # Serverless Valkey configuration with proper TLS
+                connection_params = {
+                    'host': self.redis_host,
+                    'port': self.redis_port,
+                    'username': self.redis_username,
+                    'password': self.redis_password,
+                    'ssl': True,
+                    'ssl_cert_reqs': ssl.CERT_REQUIRED,
+                    'ssl_ca_certs': certifi.where(),
+                    'decode_responses': True,
+                    'socket_connect_timeout': 2.0,
+                    'socket_timeout': 2.5,
+                    'health_check_interval': 30,
+                    'socket_keepalive': True,
+                    'retry_on_timeout': True,
+                    'max_connections': 10
+                }
+            else:
+                # Local Redis configuration (no TLS)
+                connection_params = {
+                    'host': self.redis_host,
+                    'port': self.redis_port,
+                    'decode_responses': True,
+                    'socket_connect_timeout': 2.0,
+                    'socket_timeout': 2.5,
+                    'max_connections': 10
+                }
             
-            # Add credentials if provided
-            if redis_username and redis_password:
-                connection_params.update({
-                    'username': redis_username,
-                    'password': redis_password
-                })
+            # Try direct Redis client creation with simpler parameters
+            try:
+                # First try with minimal SSL configuration
+                simple_params = {
+                    'host': self.redis_host,
+                    'port': self.redis_port,
+                    'username': self.redis_username,
+                    'password': self.redis_password,
+                    'ssl': True,
+                    'decode_responses': True,
+                    'socket_connect_timeout': 5.0,
+                    'socket_timeout': 5.0
+                }
+                self.redis = redis.asyncio.Redis(**simple_params)
+                self.redis_pool = None
+            except Exception as simple_error:
+                logger.warning(f"Simple SSL config failed: {simple_error}, trying sync client")
+                # Fallback to sync Redis client if async doesn't work
+                self.redis = redis.Redis(**simple_params)
+                self.redis_pool = None
             
-            # Create connection pool for better reliability
-            self.redis_pool = redis.ConnectionPool(**connection_params)
-            self.redis = redis.Redis(connection_pool=self.redis_pool)
-            
-            # Test Redis connection with quick retries for regular cluster
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    self.redis.ping()
-                    logger.info(f"Connected to Redis/Valkey at {redis_host}:{redis_port} for incident correlation")
-                    break
-                except Exception as retry_e:
-                    if attempt == max_retries - 1:
-                        # On final attempt, log warning but don't fail completely
-                        logger.warning(f"Failed to connect to Redis/Valkey at {redis_host} after {max_retries} attempts: {retry_e}")
-                        logger.warning("Continuing without Valkey correlation - incidents will be created individually")
-                        self.redis = None
-                        self.redis_pool = None
-                        break
-                else:
-                        logger.warning(f"Redis connection attempt {attempt + 1} failed: {retry_e}, retrying...")
-                        import time
-                        # Quick retry for regular cluster
-                        time.sleep(1)
+            # Connection created, will test on first use
+            logger.info(f"Redis/Valkey client configured for {self.redis_host}:{self.redis_port} (connection will be tested on first use)")
                         
         except Exception as e:
             logger.warning(f"Failed to initialize Redis/Valkey connection: {e}")
@@ -190,27 +202,78 @@ class EventCorrelationAgent:
         except Exception:
             pass
 
-    def _ensure_redis_connection(self) -> bool:
+    async def _ping_redis(self):
+        """Helper method to ping Redis with sync/async compatibility"""
+        try:
+            if hasattr(self.redis, 'ping'):
+                # Check if it's an async Redis client
+                if hasattr(self.redis, '_async') or 'asyncio' in str(type(self.redis)):
+                    return await self.redis.ping()
+                else:
+                    # It's a sync client, call ping directly
+                    return self.redis.ping()
+            return False
+        except Exception as e:
+            logger.debug(f"Redis ping failed: {e}")
+            return False
+
+    async def initialize_redis_connection(self):
+        """Initialize Redis/Valkey connection with TLS support (called during app startup)"""
+        if self.redis_host == 'localhost':
+            logger.warning("Skipping Redis initialization - REDIS_HOST not configured")
+            return
+            
+        try:
+            logger.info(f"Testing connection to Valkey at {self.redis_host}:{self.redis_port}")
+            
+            # Test connection with retries
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    ping_result = await self._ping_redis()
+                    if ping_result:
+                        logger.info(f"Successfully connected to Redis/Valkey at {self.redis_host}:{self.redis_port}")
+                        return
+                    else:
+                        raise Exception("Ping returned False or None")
+                except Exception as retry_e:
+                    if attempt == max_retries - 1:
+                        logger.warning(f"Failed to connect to Redis/Valkey at {self.redis_host} after {max_retries} attempts: {retry_e}")
+                        logger.warning("Continuing without Valkey correlation - incidents will be created individually")
+                        self.redis = None
+                        self.redis_pool = None
+                        return
+                    else:
+                        logger.warning(f"Redis connection attempt {attempt + 1} failed: {retry_e}, retrying...")
+                        await asyncio.sleep(1)
+                        
+        except Exception as e:
+            logger.warning(f"Failed to test Redis/Valkey connection: {e}")
+            logger.warning("Continuing without Valkey correlation - incidents will be created individually")
+            self.redis = None
+
+    async def _ensure_redis_connection(self) -> bool:
         """Ensure Redis connection is available, attempt reconnection if needed"""
         if not self.redis:
             return False
             
         try:
-            self.redis.ping()
-            return True
+            ping_result = await self._ping_redis()
+            return bool(ping_result)
         except Exception as e:
             logger.warning(f"Redis connection lost: {e}, attempting reconnection...")
             # Try to reconnect once
             try:
                 if hasattr(self, 'redis_pool') and self.redis_pool:
                     self.redis = redis.Redis(connection_pool=self.redis_pool)
-                    self.redis.ping()
-                    logger.info("Redis reconnection successful")
-                    return True
+                    ping_result = await self._ping_redis()
+                    if ping_result:
+                        logger.info("Redis reconnection successful")
+                        return True
             except Exception as reconnect_e:
                 logger.warning(f"Redis reconnection failed: {reconnect_e}")
-                self.redis = None
-                return False
+            self.redis = None
+            return False
 
     def _get_utc_timestamp(self) -> str:
         """Get current UTC timestamp in proper ISO format with Z suffix"""
@@ -230,13 +293,38 @@ class EventCorrelationAgent:
             return self._get_utc_timestamp()
 
     async def send_incident_to_edal_jobs_queue(self, incident_data: Dict, environment: str) -> Optional[str]:
-        """Send incident information to edal-dev-jobs-queue for processing"""
+        """Send incident information to both edal-dev-jobs-queue and context-fetcher-queue for processing"""
         try:
             # Extract required information from incident data
             company_slug = self.find_company_prefix(incident_data.get('bucket_name', ''), incident_data)
             
-            # Create the incident payload for edal jobs queue
-            edal_incident = {
+            # Create the new EDAL-JOB schema payload for edal jobs queue
+            edal_job_payload = {
+                "type": "EDAL-JOB",
+                "data": {
+                    "Session_id": str(uuid.uuid4()),  # Generate a session ID
+                    "incident_id": incident_data.get('incident_id', ''),
+                    "title": incident_data.get('title', ''),
+                    "service": incident_data.get('service', {}),
+                    "service_id": incident_data.get('service_id', ''),
+                    "source": incident_data.get('source', ''),
+                    "description": incident_data.get('description', ''),
+                    "priority": incident_data.get('priority', ''),
+                    "urgency": incident_data.get('urgency', ''),
+                    "priority_score": int(incident_data.get('priority_score', 0)),
+                    "compslug": company_slug,
+                    "company_id": incident_data.get('company_id', ''),
+                    "status": "triggered",
+                    "created_at": incident_data.get('created_at', ''),
+                    "updated_at": incident_data.get('updated_at', ''),
+                    "first_alert_at": incident_data.get('first_alert_at', ''),
+                    "last_alert_at": incident_data.get('last_alert_at', ''),
+                    "environment": environment,
+                }
+            }
+            
+            # Keep the old schema for context fetcher queue
+            context_payload = {
                 "Session_id": str(uuid.uuid4()),  # Generate a session ID
                 "incident_id": incident_data.get('incident_id', ''),
                 "title": incident_data.get('title', ''),
@@ -257,87 +345,109 @@ class EventCorrelationAgent:
                 "environment": environment,
             }
             
-            # Send to edal jobs queue
-            response = self.sqs.send_message(
-                QueueUrl=self.edal_jobs_queue_url,
-                MessageBody=json.dumps(edal_incident),
-                MessageAttributes={
-                    'incident_id': {
-                        'StringValue': edal_incident['incident_id'],
-                        'DataType': 'String'
-                    },
-                    'environment': {
-                        'StringValue': environment,
-                        'DataType': 'String'
-                    },
-                    'message_type': {
-                        'StringValue': 'incident_job',
-                        'DataType': 'String'
-                    }
+            # Common message attributes
+            message_attributes = {
+                'incident_id': {
+                    'StringValue': incident_data.get('incident_id', ''),
+                    'DataType': 'String'
+                },
+                'environment': {
+                    'StringValue': environment,
+                    'DataType': 'String'
+                },
+                'message_type': {
+                    'StringValue': 'incident_job',
+                    'DataType': 'String'
                 }
-            )
+            }
             
-            message_id = response.get('MessageId')
-            logger.info(f"Successfully sent incident {edal_incident['incident_id']} to edal jobs queue: {message_id}")
-            return message_id
+            # Send to edal jobs queue (FIFO) with new EDAL-JOB schema
+            try:
+                edal_response = self.sqs.send_message(
+                    QueueUrl=self.edal_jobs_queue_url,
+                    MessageBody=json.dumps(edal_job_payload),
+                    MessageAttributes=message_attributes,
+                    MessageGroupId=f"{company_slug}-{environment}",  # Required for FIFO
+                    MessageDeduplicationId=f"{incident_data.get('incident_id', '')}-{int(time.time())}"  # Required for FIFO
+                )
+                edal_message_id = edal_response.get('MessageId')
+                logger.info(f"Successfully sent EDAL-JOB incident {incident_data.get('incident_id', '')} to edal jobs queue: {edal_message_id}")
+            except Exception as e:
+                logger.error(f"Failed to send incident to edal jobs queue: {e}")
+                edal_message_id = None
+            
+            # Send to context fetcher queue (FIFO) with old schema
+            try:
+                context_response = self.sqs.send_message(
+                    QueueUrl=self.context_fetcher_queue_url,
+                    MessageBody=json.dumps(context_payload),
+                    MessageAttributes=message_attributes,
+                    MessageGroupId=f"{company_slug}-{environment}",  # Required for FIFO
+                    MessageDeduplicationId=f"{incident_data.get('incident_id', '')}-context-{int(time.time())}"  # Required for FIFO
+                )
+                context_message_id = context_response.get('MessageId')
+                logger.info(f"Successfully sent incident {incident_data.get('incident_id', '')} to context fetcher queue: {context_message_id}")
+            except Exception as e:
+                logger.error(f"Failed to send incident to context fetcher queue: {e}")
+                context_message_id = None
+            
+            # Return the edal message ID for compatibility
+            return edal_message_id
             
         except Exception as e:
             logger.error(f"Failed to send incident to edal jobs queue: {e}")
             return None
 
-    def check_for_existing_incident_valkey(self, alert: Dict) -> Optional[str]:
+    async def check_for_existing_incident_valkey(self, alert: Dict) -> Optional[str]:
         """Check Valkey for existing incidents that could correlate with this alert (replaces OpenSearch logic)"""
-        if not self._ensure_redis_connection():
+        if not await self._ensure_redis_connection():
             return None
             
         try:
             # Create correlation key based on alert characteristics (same logic as OpenSearch)
-            service = alert.get('service', '').lower()
-            severity = alert.get('severity', '').lower()
-            alert_type = alert.get('type', '').lower()
-            source = alert.get('source', '').lower()
+            # Handle service field which can be a dict or string
+            service_field = alert.get('service', '')
+            if isinstance(service_field, dict):
+                service = service_field.get('name', '').lower()
+            else:
+                service = str(service_field).lower()
+                
+            severity = str(alert.get('severity', '')).lower()
+            alert_type = str(alert.get('type', '')).lower()
+            source = str(alert.get('source', '')).lower()
             company_id = alert.get('company_id', '')
             
-            # Look for recent incidents with similar characteristics (60 minute window)
-            search_patterns = [
-                f"incident:*:service:{service}:company:{company_id}",
-                f"incident:*:severity:{severity}:company:{company_id}",
-                f"incident:*:type:{alert_type}:company:{company_id}",
-                f"incident:*:source:{source}:company:{company_id}"
-            ]
-            
-            # Find incidents from last 60 minutes
+            # Use sets to track incidents by characteristics (Serverless Valkey doesn't support KEYS)
+            # Look for recent incidents by checking specific correlation sets
             cutoff_time = datetime.utcnow() - timedelta(minutes=60)
             
-            for pattern in search_patterns:
-                search_keys = self.redis.keys(pattern)
-                
-                for search_key in search_keys:
-                    # Get incident_id from the search key value
-                    incident_id = self.redis.get(search_key)
+            # Check for incidents with same service
+            service_set_key = f"incidents:service:{service}:company:{company_id}"
+            incident_ids = await self.redis.smembers(service_set_key)
+            
+            for incident_id in incident_ids:
+                if incident_id:
+                    # Get incident metadata using the incident_id
+                    incident_meta_key = f"incident:{incident_id}:meta"
+                    incident_data = await self.redis.hgetall(incident_meta_key)
                     
-                    if incident_id:
-                        # Get incident metadata using the incident_id
-                        incident_meta_key = f"incident:{incident_id}:meta"
-                        incident_data = self.redis.hgetall(incident_meta_key)
+                    if incident_data:
+                        # Check if incident is recent
+                        created_at = incident_data.get('created_at', '')
                         
-                        if incident_data:
-                            # Check if incident is recent
-                            created_at = incident_data.get('created_at', '')
-                            
-                            if created_at:
-                                try:
-                                    created_time = datetime.fromisoformat(created_at.rstrip('Z'))
+                        if created_at:
+                            try:
+                                created_time = datetime.fromisoformat(created_at.rstrip('Z'))
+                                
+                                if created_time > cutoff_time:
+                                    # Check for correlation based on similarity (same logic as OpenSearch)
+                                    representative_alert_json = incident_data.get('representative_alert', '{}')
+                                    representative_alert = json.loads(representative_alert_json)
                                     
-                                    if created_time > cutoff_time:
-                                        # Check for correlation based on similarity (same logic as OpenSearch)
-                                        representative_alert_json = incident_data.get('representative_alert', '{}')
-                                        representative_alert = json.loads(representative_alert_json)
-                                        
-                                        if self._are_alerts_similar_for_correlation(alert, representative_alert):
-                                            return incident_id
-                                except Exception:
-                                    continue
+                                    if self._are_alerts_similar_for_correlation(alert, representative_alert):
+                                        return incident_id
+                            except Exception:
+                                continue
             
             return None
                                  
@@ -421,9 +531,9 @@ class EventCorrelationAgent:
         
         return is_similar
 
-    def create_incident_in_valkey(self, incident_id: str, alert: Dict):
+    async def create_incident_in_valkey(self, incident_id: str, alert: Dict):
         """Create a new incident in Valkey for future correlation"""
-        if not self._ensure_redis_connection():
+        if not await self._ensure_redis_connection():
             return
             
         try:
@@ -431,32 +541,40 @@ class EventCorrelationAgent:
             
             # Store incident metadata
             incident_key = f"incident:{incident_id}:meta"
-            self.redis.hset(incident_key, "incident_id", incident_id)
-            self.redis.hset(incident_key, "created_at", current_time)
-            self.redis.hset(incident_key, "last_updated", current_time)
-            self.redis.hset(incident_key, "alert_count", 1)
-            self.redis.hset(incident_key, "status", "open")
-            self.redis.hset(incident_key, "representative_alert", json.dumps(alert))
+            await self.redis.hset(incident_key, "incident_id", incident_id)
+            await self.redis.hset(incident_key, "created_at", current_time)
+            await self.redis.hset(incident_key, "last_updated", current_time)
+            await self.redis.hset(incident_key, "alert_count", 1)
+            await self.redis.hset(incident_key, "status", "open")
+            await self.redis.hset(incident_key, "representative_alert", json.dumps(alert))
             
             # Create searchable keys for correlation
-            service = alert.get('service', '').lower()
-            severity = alert.get('severity', '').lower()
-            alert_type = alert.get('type', '').lower()
-            source = alert.get('source', '').lower()
+            # Handle service field which can be a dict or string
+            service_field = alert.get('service', '')
+            if isinstance(service_field, dict):
+                service = service_field.get('name', '').lower()
+            else:
+                service = str(service_field).lower()
+                
+            severity = str(alert.get('severity', '')).lower()
+            alert_type = str(alert.get('type', '')).lower()
+            source = str(alert.get('source', '')).lower()
             company_id = alert.get('company_id', '')
             
-            search_keys = [
-                f"incident:{incident_id}:service:{service}:company:{company_id}",
-                f"incident:{incident_id}:severity:{severity}:company:{company_id}",
-                f"incident:{incident_id}:type:{alert_type}:company:{company_id}",
-                f"incident:{incident_id}:source:{source}:company:{company_id}"
+            # Add incident to correlation sets (instead of individual keys)
+            correlation_sets = [
+                f"incidents:service:{service}:company:{company_id}",
+                f"incidents:severity:{severity}:company:{company_id}",
+                f"incidents:type:{alert_type}:company:{company_id}",
+                f"incidents:source:{source}:company:{company_id}"
             ]
             
-            for search_key in search_keys:
-                self.redis.set(search_key, incident_id, ex=86400)  # 24 hour expiration
+            for set_key in correlation_sets:
+                await self.redis.sadd(set_key, incident_id)
+                await self.redis.expire(set_key, 86400)  # 24 hour expiration
                 
             # Set expiration (24 hours)
-            self.redis.expire(incident_key, 86400)
+            await self.redis.expire(incident_key, 86400)
             
             logger.info(f"Created incident {incident_id} in Valkey")
             
@@ -1030,71 +1148,377 @@ class EventCorrelationAgent:
             return 0.0
     
     def calculate_multi_signal_correlation(self, alert1: Dict, alert2: Dict) -> Tuple[float, float, Dict]:
-        """Calculate multi-signal correlation between two alerts"""
+        """
+        Calculate BigPanda-style multi-signal correlation using all 7 correlation techniques:
+        1. Time-based correlation
+        2. Rule-based correlation  
+        3. Pattern-based correlation
+        4. Topology-based correlation
+        5. Domain-based correlation
+        6. History-based correlation
+        7. Codebook correlation
+        """
         try:
             signals = {}
             
-            # 1. Semantic correlation (title + description)
-            semantic_score = self.calculate_semantic_similarity(alert1, alert2)
-            signals['semantic'] = {
-                'score': semantic_score,
-                'explanation': f'Text similarity: {semantic_score:.2f}'
-            }
-            
-            # 2. Service correlation
-            service1 = str(alert1.get('service', '')).lower()
-            service2 = str(alert2.get('service', '')).lower()
-            service_score = 1.0 if service1 == service2 and service1 else 0.0
-            signals['service'] = {
-                'score': service_score,
-                'explanation': f'Same service: {service_score > 0}'
-            }
-            
-            # 3. Time proximity
+            # 1. TIME-BASED CORRELATION (BigPanda technique #1)
             time_score = self.calculate_time_proximity_score(alert1, alert2)
-            signals['time'] = {
+            signals['time_based'] = {
                 'score': time_score,
-                'explanation': f'Time proximity: {time_score:.2f}'
+                'explanation': f'Time proximity correlation: {time_score:.2f}',
+                'technique': 'Time-based event correlation'
             }
             
-            # 4. Company correlation
-            company1 = alert1.get('company_id')
-            company2 = alert2.get('company_id')
-            company_score = 1.0 if company1 == company2 and company1 else 0.0
-            signals['company'] = {
-                'score': company_score,
-                'explanation': f'Same company: {company_score > 0}'
+            # 2. RULE-BASED CORRELATION (BigPanda technique #2)
+            rule_score = self.calculate_rule_based_correlation(alert1, alert2)
+            signals['rule_based'] = {
+                'score': rule_score,
+                'explanation': f'Rule-based matching: {rule_score:.2f}',
+                'technique': 'Rule-based event correlation'
             }
             
-            # 5. Source correlation
-            source1 = alert1.get('source', '').lower()
-            source2 = alert2.get('source', '').lower()
-            source_score = 1.0 if source1 == source2 and source1 else 0.0
-            signals['source'] = {
-                'score': source_score,
-                'explanation': f'Same source: {source_score > 0}'
+            # 3. PATTERN-BASED CORRELATION (BigPanda technique #3)
+            pattern_score = self.calculate_pattern_based_correlation(alert1, alert2)
+            signals['pattern_based'] = {
+                'score': pattern_score,
+                'explanation': f'Pattern similarity: {pattern_score:.2f}',
+                'technique': 'Pattern-based event correlation'
             }
             
-            # Calculate weighted total score
+            # 4. TOPOLOGY-BASED CORRELATION (BigPanda technique #4)
+            topology_score = self.calculate_topology_based_correlation(alert1, alert2)
+            signals['topology_based'] = {
+                'score': topology_score,
+                'explanation': f'Topology/service correlation: {topology_score:.2f}',
+                'technique': 'Topology-based event correlation'
+            }
+            
+            # 5. DOMAIN-BASED CORRELATION (BigPanda technique #5)
+            domain_score = self.calculate_domain_based_correlation(alert1, alert2)
+            signals['domain_based'] = {
+                'score': domain_score,
+                'explanation': f'Domain/source correlation: {domain_score:.2f}',
+                'technique': 'Domain-based event correlation'
+            }
+            
+            # 6. HISTORY-BASED CORRELATION (BigPanda technique #6)
+            history_score = self.calculate_history_based_correlation(alert1, alert2)
+            signals['history_based'] = {
+                'score': history_score,
+                'explanation': f'Historical pattern match: {history_score:.2f}',
+                'technique': 'History-based event correlation'
+            }
+            
+            # 7. CODEBOOK CORRELATION (BigPanda technique #7)
+            codebook_score = self.calculate_codebook_correlation(alert1, alert2)
+            signals['codebook'] = {
+                'score': codebook_score,
+                'explanation': f'Codebook matrix match: {codebook_score:.2f}',
+                'technique': 'Codebook event correlation'
+            }
+            
+            # BigPanda-style weighted scoring (balanced across all 7 techniques)
             weights = {
-                'semantic': 0.3,
-                'service': 0.25,
-                'time': 0.2,
-                'company': 0.15,
-                'source': 0.1
+                'time_based': 0.20,      # 20% - Time proximity is critical
+                'rule_based': 0.15,      # 15% - Explicit rule matching
+                'pattern_based': 0.20,   # 20% - AI pattern recognition (most important)
+                'topology_based': 0.15,  # 15% - Service/infrastructure topology
+                'domain_based': 0.10,    # 10% - Domain/source correlation
+                'history_based': 0.10,   # 10% - Historical pattern matching
+                'codebook': 0.10         # 10% - Codebook matrix correlation
             }
             
+            # Calculate weighted total score (BigPanda approach)
             total_score = sum(signals[signal]['score'] * weights[signal] for signal in weights)
             
-            # Calculate confidence based on how many signals are active
+            # BigPanda-style confidence calculation
             active_signals = sum(1 for signal in signals.values() if signal['score'] > 0.1)
             confidence = active_signals / len(signals)
+            
+            # Add compression ratio calculation (BigPanda KPI)
+            compression_ratio = self.calculate_compression_ratio(total_score)
+            signals['compression_info'] = {
+                'ratio': compression_ratio,
+                'explanation': f'Expected compression: {compression_ratio:.1%}'
+            }
             
             return total_score, confidence, signals
             
         except Exception as e:
-            logger.warning(f"Error calculating multi-signal correlation: {e}")
+            logger.warning(f"Error calculating BigPanda-style multi-signal correlation: {e}")
             return 0.0, 0.0, {}
+
+    def calculate_rule_based_correlation(self, alert1: Dict, alert2: Dict) -> float:
+        """
+        BigPanda Rule-based correlation: Compare events to predefined rules
+        Rules check specific values like service type, severity, company, etc.
+        """
+        try:
+            rule_matches = 0
+            total_rules = 0
+            
+            # Rule 1: Same company (critical for multi-tenant)
+            total_rules += 1
+            if alert1.get('company_id') == alert2.get('company_id') and alert1.get('company_id'):
+                rule_matches += 1
+            
+            # Rule 2: Same service or service family
+            total_rules += 1
+            service1 = str(alert1.get('service', '')).lower()
+            service2 = str(alert2.get('service', '')).lower()
+            if service1 == service2 and service1:
+                rule_matches += 1
+            
+            # Rule 3: Similar severity levels
+            total_rules += 1
+            sev1 = str(alert1.get('severity', '')).lower()
+            sev2 = str(alert2.get('severity', '')).lower()
+            if sev1 == sev2 and sev1:
+                rule_matches += 1
+            
+            # Rule 4: Same environment
+            total_rules += 1
+            env1 = str(alert1.get('environment', '')).lower()
+            env2 = str(alert2.get('environment', '')).lower()
+            if env1 == env2 and env1:
+                rule_matches += 1
+            
+            # Rule 5: Same alert type/category
+            total_rules += 1
+            type1 = str(alert1.get('alert_type', alert1.get('type', ''))).lower()
+            type2 = str(alert2.get('alert_type', alert2.get('type', ''))).lower()
+            if type1 == type2 and type1:
+                rule_matches += 1
+            
+            return rule_matches / total_rules if total_rules > 0 else 0.0
+            
+        except Exception as e:
+            logger.warning(f"Error in rule-based correlation: {e}")
+            return 0.0
+
+    def calculate_pattern_based_correlation(self, alert1: Dict, alert2: Dict) -> float:
+        """
+        BigPanda Pattern-based correlation: Uses ML to find events matching defined patterns
+        Combines semantic similarity with pattern recognition
+        """
+        try:
+            # Use semantic similarity as base pattern matching
+            semantic_score = self.calculate_semantic_similarity(alert1, alert2)
+            
+            # Pattern enhancement: Check for common error patterns
+            title1 = str(alert1.get('title', '')).lower()
+            title2 = str(alert2.get('title', '')).lower()
+            
+            # Common patterns in alert titles
+            error_patterns = [
+                'timeout', 'connection', 'failed', 'error', 'exception',
+                'unavailable', 'down', 'high', 'low', 'critical'
+            ]
+            
+            pattern_matches = 0
+            for pattern in error_patterns:
+                if pattern in title1 and pattern in title2:
+                    pattern_matches += 1
+            
+            # Combine semantic similarity with pattern matching
+            pattern_bonus = min(pattern_matches * 0.1, 0.3)  # Max 30% bonus
+            
+            return min(semantic_score + pattern_bonus, 1.0)
+            
+        except Exception as e:
+            logger.warning(f"Error in pattern-based correlation: {e}")
+            return 0.0
+
+    def calculate_topology_based_correlation(self, alert1: Dict, alert2: Dict) -> float:
+        """
+        BigPanda Topology-based correlation: Uses network/service topology
+        Maps alerts to affected nodes and their relationships
+        """
+        try:
+            # Service topology correlation
+            service1 = str(alert1.get('service', '')).lower()
+            service2 = str(alert2.get('service', '')).lower()
+            
+            # Direct service match
+            if service1 == service2 and service1:
+                return 1.0
+            
+            # Service dependency patterns (simplified topology)
+            service_dependencies = {
+                'database': ['api', 'backend', 'service'],
+                'api': ['frontend', 'web', 'client'],
+                'cache': ['api', 'database', 'backend'],
+                'queue': ['worker', 'processor', 'consumer']
+            }
+            
+            # Check if services are in same dependency chain
+            for primary, dependents in service_dependencies.items():
+                if primary in service1:
+                    for dependent in dependents:
+                        if dependent in service2:
+                            return 0.7  # High correlation for dependent services
+                if primary in service2:
+                    for dependent in dependents:
+                        if dependent in service1:
+                            return 0.7
+            
+            # Host/node correlation
+            host1 = alert1.get('host', alert1.get('node', ''))
+            host2 = alert2.get('host', alert2.get('node', ''))
+            if host1 == host2 and host1:
+                return 0.8
+            
+            return 0.0
+            
+        except Exception as e:
+            logger.warning(f"Error in topology-based correlation: {e}")
+            return 0.0
+
+    def calculate_domain_based_correlation(self, alert1: Dict, alert2: Dict) -> float:
+        """
+        BigPanda Domain-based correlation: Connects events from related IT domains
+        (network, application, infrastructure)
+        """
+        try:
+            # Source system correlation (monitoring domains)
+            source1 = str(alert1.get('source', '')).lower()
+            source2 = str(alert2.get('source', '')).lower()
+            
+            # Direct source match
+            if source1 == source2 and source1:
+                return 1.0
+            
+            # Domain groupings
+            monitoring_domains = {
+                'infrastructure': ['prometheus', 'nagios', 'zabbix', 'datadog'],
+                'application': ['newrelic', 'appdynamics', 'dynatrace'],
+                'network': ['snmp', 'netflow', 'prtg'],
+                'cloud': ['cloudwatch', 'azure', 'gcp'],
+                'logging': ['elk', 'splunk', 'fluentd', 'logstash']
+            }
+            
+            # Check if sources are in same domain
+            for domain, sources in monitoring_domains.items():
+                source1_in_domain = any(s in source1 for s in sources)
+                source2_in_domain = any(s in source2 for s in sources)
+                if source1_in_domain and source2_in_domain:
+                    return 0.6  # Same monitoring domain
+            
+            return 0.0
+            
+        except Exception as e:
+            logger.warning(f"Error in domain-based correlation: {e}")
+            return 0.0
+
+    def calculate_history_based_correlation(self, alert1: Dict, alert2: Dict) -> float:
+        """
+        BigPanda History-based correlation: Matches new events with historical patterns
+        Uses past correlation decisions to improve future matching
+        """
+        try:
+            # Simplified historical pattern matching
+            # In production, this would query historical correlation database
+            
+            # Create signature for alert patterns
+            sig1 = self.create_alert_signature(alert1)
+            sig2 = self.create_alert_signature(alert2)
+            
+            # Check if we've seen this pattern combination before
+            # This is a simplified version - real implementation would use Redis/DB
+            historical_patterns = getattr(self, '_historical_patterns', {})
+            
+            pattern_key = tuple(sorted([sig1, sig2]))
+            if pattern_key in historical_patterns:
+                return historical_patterns[pattern_key]
+            
+            # For new patterns, use heuristic based on signature similarity
+            sig_similarity = len(set(sig1.split('|')) & set(sig2.split('|'))) / max(len(sig1.split('|')), len(sig2.split('|')), 1)
+            
+            return min(sig_similarity, 0.8)  # Cap at 80% for historical matching
+            
+        except Exception as e:
+            logger.warning(f"Error in history-based correlation: {e}")
+            return 0.0
+
+    def calculate_codebook_correlation(self, alert1: Dict, alert2: Dict) -> float:
+        """
+        BigPanda Codebook correlation: Uses coded event matrix mapping
+        Events are coded and mapped to correlation matrix
+        """
+        try:
+            # Create codebook entries for alerts
+            code1 = self.generate_alert_code(alert1)
+            code2 = self.generate_alert_code(alert2)
+            
+            # Codebook matrix (simplified - real implementation would be larger)
+            codebook_matrix = {
+                ('DB', 'API'): 0.8,    # Database issues often affect APIs
+                ('NET', 'APP'): 0.7,   # Network issues affect applications
+                ('CPU', 'MEM'): 0.6,   # CPU and memory often correlated
+                ('DISK', 'IO'): 0.9,   # Disk and I/O highly correlated
+                ('AUTH', 'SEC'): 0.8,  # Authentication and security related
+            }
+            
+            # Check direct code match
+            if code1 == code2:
+                return 1.0
+            
+            # Check codebook matrix
+            code_pair = tuple(sorted([code1, code2]))
+            if code_pair in codebook_matrix:
+                return codebook_matrix[code_pair]
+            
+            # Check reverse pair
+            reverse_pair = (code_pair[1], code_pair[0])
+            if reverse_pair in codebook_matrix:
+                return codebook_matrix[reverse_pair]
+            
+            return 0.0
+            
+        except Exception as e:
+            logger.warning(f"Error in codebook correlation: {e}")
+            return 0.0
+
+    def create_alert_signature(self, alert: Dict) -> str:
+        """Create a signature for historical pattern matching"""
+        service = str(alert.get('service', 'unknown'))[:10]
+        source = str(alert.get('source', 'unknown'))[:10]
+        severity = str(alert.get('severity', 'unknown'))[:5]
+        return f"{service}|{source}|{severity}"
+
+    def generate_alert_code(self, alert: Dict) -> str:
+        """Generate codebook code for alert"""
+        title = str(alert.get('title', '')).lower()
+        
+        # Codebook mapping based on alert content
+        if any(word in title for word in ['database', 'db', 'sql']):
+            return 'DB'
+        elif any(word in title for word in ['api', 'endpoint', 'service']):
+            return 'API'
+        elif any(word in title for word in ['network', 'connection', 'timeout']):
+            return 'NET'
+        elif any(word in title for word in ['cpu', 'processor']):
+            return 'CPU'
+        elif any(word in title for word in ['memory', 'ram', 'oom']):
+            return 'MEM'
+        elif any(word in title for word in ['disk', 'storage', 'space']):
+            return 'DISK'
+        elif any(word in title for word in ['io', 'input', 'output']):
+            return 'IO'
+        elif any(word in title for word in ['auth', 'login', 'permission']):
+            return 'AUTH'
+        elif any(word in title for word in ['security', 'ssl', 'certificate']):
+            return 'SEC'
+        else:
+            return 'APP'  # Default application code
+
+    def calculate_compression_ratio(self, correlation_score: float) -> float:
+        """Calculate expected compression ratio based on correlation score (BigPanda KPI)"""
+        # Higher correlation score = higher compression potential
+        # BigPanda targets 70-85% compression
+        base_compression = 0.70  # 70% base compression
+        score_bonus = correlation_score * 0.25  # Up to 25% additional compression
+        return min(base_compression + score_bonus, 0.95)  # Cap at 95%
     
     def apply_sliding_time_window(self, alerts: List[Dict]) -> List[List[Dict]]:
         """
@@ -1220,7 +1644,7 @@ class EventCorrelationAgent:
                 first_alert['service'] = service
                 
                 # Check Valkey for existing incidents using our new method
-                matching_incident = self.check_for_existing_incident_valkey(first_alert)
+                matching_incident = await self.check_for_existing_incident_valkey(first_alert)
                 
                 if matching_incident:
                     logger.info(f"✅ Found matching incident in Valkey: {matching_incident}")
@@ -1356,15 +1780,14 @@ class EventCorrelationAgent:
                 logger.info(f"ACK: incident queued message_id={incident_msg_id} (correlated)")
             logger.info(f"Created new incident {incident_id} with {len(group_alerts)} alerts (priority: {priority}) in {environment} environment.")
             
-            # Trigger log fetcher lambda for the new incident
-            await self._trigger_log_fetcher(incident_id, environment)
+            # Log fetcher lambda removed - not needed
             
             # Send incident to edal jobs queue
             await self.send_incident_to_edal_jobs_queue(incident, environment)
             
             # Store incident in Valkey for future correlation (use representative alert)
             representative_alert = group_alerts[0]  # Use first alert as representative
-            self.create_incident_in_valkey(incident_id, representative_alert)
+            await self.create_incident_in_valkey(incident_id, representative_alert)
             
             # Persist incident locally (OpenSearch removed)
             if not self._index_incident_document(incident):
@@ -1504,14 +1927,13 @@ class EventCorrelationAgent:
                 logger.info(f"ACK: incident queued message_id={incident_msg_id} (single)")
             logger.info(f"Created new single incident {incident_id} for alert {alert.get('id')} (priority: {priority}) in {environment} environment.")
             
-            # Trigger log fetcher lambda for the new incident
-            await self._trigger_log_fetcher(incident_id, environment)
+            # Log fetcher lambda removed - not needed
 
             # Send incident to edal jobs queue
             await self.send_incident_to_edal_jobs_queue(incident, environment)
 
             # Store incident in Valkey for future correlation
-            self.create_incident_in_valkey(incident_id, alert)
+            await self.create_incident_in_valkey(incident_id, alert)
 
             # Persist incident locally (OpenSearch removed)
             if not self._index_incident_document(incident):
@@ -1727,44 +2149,7 @@ class EventCorrelationAgent:
         
         return correlated_incident_ids, single_incident_ids, correlation_stats
 
-    async def _trigger_log_fetcher(self, incident_id: str, environment: str):
-        """Trigger the log fetcher lambda for a new incident."""
-        try:
-            # Determine the correct Lambda function name based on environment
-            if environment == "production":
-                function_name = "bugraid-log-fetcher-prod"
-            else:
-                function_name = "bugraid-log-fetcher-dev"
-            
-            # Prepare the payload for the log fetcher
-            payload = {
-                "incident_ids": [incident_id],  # Changed to match expected format
-                "environment": environment,
-                "trigger_source": "correlation_agent",
-                "timestamp": datetime.utcnow().isoformat() + "Z"
-            }
-            
-            logger.info(f"Triggering log fetcher lambda {function_name} for incident {incident_id}")
-            logger.info(f"Payload: {json.dumps(payload)}")
-            
-            # Invoke the Lambda function asynchronously
-            response = self.lambda_client.invoke(
-                FunctionName=function_name,
-                InvocationType='Event',  # Asynchronous invocation
-                Payload=json.dumps(payload)
-            )
-            
-            logger.info(f"Lambda response: {response}")
-            
-            if response.get('StatusCode') == 202:
-                logger.info(f"Successfully triggered log fetcher for incident {incident_id}")
-            else:
-                logger.warning(f"Unexpected response from log fetcher lambda: {response}")
-                
-        except Exception as e:
-            logger.error(f"Error triggering log fetcher for incident {incident_id}: {str(e)}")
-            logger.error(f"Exception details: {str(type(e))}")
-            # Don't raise the exception as this shouldn't block incident creation
+    # _trigger_log_fetcher method removed - log fetcher lambda not needed
 
 # Correlation node function for LangGraph
 async def correlation_node(state: WorkflowState) -> WorkflowState:
@@ -1844,9 +2229,18 @@ def create_correlation_workflow():
 async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting Clustering Correlation API with Valkey")
+    
+    # Initialize Redis connection if available
+    if hasattr(app.state, 'correlation_service') and app.state.correlation_service:
+        await app.state.correlation_service.initialize_redis_connection()
+    
     yield
+    
     # Shutdown
     logger.info("Clustering Correlation API shutdown complete")
+
+# Initialize correlation service
+correlation_service = EventCorrelationAgent()
 
 # FastAPI app
 app = FastAPI(
@@ -1855,6 +2249,9 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+# Store correlation service in app state
+app.state.correlation_service = correlation_service
 
 @app.get("/health")
 async def health_check():
@@ -1912,7 +2309,7 @@ async def correlate_alerts(request: CorrelationRequest, background_tasks: Backgr
             processing_time_ms=processing_time,
             timestamp=datetime.utcnow().isoformat() + "Z"
         )
-        
+                
     except Exception as e:
         logger.error(f"Error in correlation: {e}")
         raise HTTPException(status_code=500, detail=str(e))
